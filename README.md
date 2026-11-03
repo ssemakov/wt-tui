@@ -24,10 +24,14 @@ Status, size and PR load in the background, so slow `du`/`gh` calls never block 
 | `enter` / `d` | diff of uncommitted changes (tracked vs `HEAD`, plus untracked files as new files); `q`/`esc` back |
 | `c` | copy uncommitted files to a directory |
 | `m` | move uncommitted files to a directory (copy, then discard them from the worktree) |
+| `u` | undo the last copy/move |
 | `x` | remove the worktree (asks `y/N`; dirty trees use `--force`) |
 | `o` | open the PR in the browser |
 | `r` | reload everything |
 | `q` | quit |
+
+`c`/`m` first list the uncommitted files, all checked: `space` toggles one, `a` toggles all, `enter` goes on to the
+destination prompt with the checked files, `esc` cancels.
 
 Destination prompt (`c`/`m`): `tab` completes directories zsh-style. A unique match completes, several matches extend to
 their common prefix and get listed, and further `tab`/`shift+tab` cycle through them. `~` expands, relative paths are
@@ -36,6 +40,11 @@ resolved against the directory `wt-tui` was started in, and missing directories 
 Copy/move keep repo-relative paths (`dest/app/models/x.rb`), never overwrite an existing file in the destination, and
 skip files deleted in the worktree. Move only discards changes after every copy succeeded; skipped files stay in the
 worktree.
+
+`u` undoes the last copy/move of the session. A move undo puts the files back exactly as they were, staged state and
+renames included (from a `git stash create` snapshot taken before the discard), and refuses if those paths changed in
+the worktree since. Then it deletes the destination copies that still match the worktree, plus the directories it
+created for them; copies edited since are left in place.
 
 ## Build
 

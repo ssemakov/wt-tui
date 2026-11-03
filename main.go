@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,8 +65,11 @@ type (
 		pr   *pr
 		err  error
 	}
-	diffMsg    struct{ path, text string }
-	doneMsg    struct{ path, text string }
+	diffMsg struct{ path, text string }
+	doneMsg struct {
+		path, text string
+		undo       *undo
+	}
 	removedMsg struct {
 		path string
 		err  error
@@ -303,22 +307,59 @@ func removeCmd(mainPath, path string, force bool) tea.Cmd {
 
 func transferCmd(path string, files []change, dest string, move bool) tea.Cmd {
 	return func() tea.Msg {
-		text, err := transfer(path, files, dest, move)
+		u, text, err := transfer(path, files, dest, move)
 		if err != nil {
 			text = "error: " + err.Error()
 		}
-		return doneMsg{path, text}
+		if u != nil && len(u.files) == 0 {
+			u = nil
+		}
+		return doneMsg{path, text, u}
 	}
+}
+
+func undoCmd(u *undo) tea.Cmd {
+	return func() tea.Msg {
+		text, err := revert(u)
+		if err != nil {
+			// revert refuses to run over files changed since, so the record stays retryable
+			return doneMsg{u.path, "error: " + err.Error(), u}
+		}
+		return doneMsg{u.path, text, nil}
+	}
+}
+
+// undo records what a transfer did to dest and, for a move, the stash commit holding the discarded changes.
+type undo struct {
+	path, dest, snap string
+	files            []change
+	made             []string
+	move             bool
+}
+
+// tracked lists the paths git restores for cs, rename sources included.
+func tracked(cs []change) []string {
+	var ps []string
+	for _, c := range cs {
+		if c.xy == "??" {
+			continue
+		}
+		ps = append(ps, c.path)
+		if c.orig != "" {
+			ps = append(ps, c.orig)
+		}
+	}
+	return ps
 }
 
 // transfer copies uncommitted files under dest keeping repo-relative paths; move then discards them from the worktree.
 // Existing dest files are never overwritten, and nothing is discarded unless every copy succeeded.
-func transfer(path string, files []change, dest string, move bool) (string, error) {
+func transfer(path string, files []change, dest string, move bool) (*undo, string, error) {
 	dest, err := filepath.Abs(expand(dest))
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
-	var copied []change
+	u := &undo{path: path, dest: dest}
 	var exists, gone int
 	for _, c := range files {
 		src, dst := filepath.Join(path, c.path), filepath.Join(dest, c.path)
@@ -330,29 +371,36 @@ func transfer(path string, files []change, dest string, move bool) (string, erro
 			exists++
 			continue
 		}
-		if err := copyPath(src, dst); err != nil {
-			return "", fmt.Errorf("after %d file(s), nothing discarded: %w", len(copied), err)
+		// copyPath creates these, so undo removes them
+		for d := filepath.Dir(dst); ; d = filepath.Dir(d) {
+			if _, err := os.Lstat(d); err == nil {
+				break
+			}
+			u.made = append(u.made, d)
 		}
-		copied = append(copied, c)
+		if err := copyPath(src, dst); err != nil {
+			return u, "", fmt.Errorf("after %d file(s), nothing discarded: %w", len(u.files), err)
+		}
+		u.files = append(u.files, c)
 	}
-	if move {
-		var tracked []string
-		for _, c := range copied {
+	if move && len(u.files) > 0 {
+		// ponytail: the stash commit is unreferenced; gc keeps it ~2 weeks, ample for an in-session undo
+		snap, err := git(path, "stash", "create")
+		if err != nil {
+			return u, "", err
+		}
+		u.snap, u.move = strings.TrimSpace(snap), true
+		for _, c := range u.files {
 			if c.xy == "??" {
 				if err := os.Remove(filepath.Join(path, c.path)); err != nil {
-					return "", err
+					return u, "", err
 				}
-				continue
-			}
-			tracked = append(tracked, c.path)
-			if c.orig != "" {
-				tracked = append(tracked, c.orig)
 			}
 		}
-		if len(tracked) > 0 {
-			args := append([]string{"--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--"}, tracked...)
+		if t := tracked(u.files); len(t) > 0 {
+			args := append([]string{"--literal-pathspecs", "restore", "--source=HEAD", "--staged", "--worktree", "--"}, t...)
 			if _, err := git(path, args...); err != nil {
-				return "", err
+				return u, "", err
 			}
 		}
 	}
@@ -360,14 +408,87 @@ func transfer(path string, files []change, dest string, move bool) (string, erro
 	if move {
 		verb = "moved"
 	}
-	s := fmt.Sprintf("%s %d file(s) to %s", verb, len(copied), dest)
+	s := fmt.Sprintf("%s %d file(s) to %s", verb, len(u.files), dest)
 	if exists > 0 {
 		s += fmt.Sprintf(", %d skipped (already in dest)", exists)
 	}
 	if gone > 0 {
 		s += fmt.Sprintf(", %d skipped (deleted in worktree)", gone)
 	}
+	return u, s, nil
+}
+
+// revert puts moved files back exactly as they were, then deletes the dest copies that still match the worktree.
+func revert(u *undo) (string, error) {
+	if u.move {
+		check := tracked(u.files)
+		for _, c := range u.files {
+			if c.xy == "??" {
+				check = append(check, c.path)
+			}
+		}
+		out, err := git(u.path, append([]string{"--literal-pathspecs", "status", "--porcelain", "--untracked-files=all", "--"}, check...)...)
+		if err != nil {
+			return "", err
+		}
+		if out != "" {
+			return "", errors.New("moved files changed in the worktree since, nothing undone")
+		}
+		if t := tracked(u.files); len(t) > 0 {
+			// worktree first: once the index drops a rename source, git no longer matches it to delete the file
+			restore := func(src, where string) error {
+				_, err := git(u.path, append([]string{"--literal-pathspecs", "restore", "--source=" + src, where, "--"}, t...)...)
+				return err
+			}
+			if err := restore(u.snap, "--worktree"); err != nil {
+				return "", err
+			}
+			// stash commits keep the index as their second parent
+			if err := restore(u.snap+"^2", "--staged"); err != nil {
+				return "", err
+			}
+		}
+		for _, c := range u.files {
+			if c.xy == "??" {
+				if err := copyPath(filepath.Join(u.dest, c.path), filepath.Join(u.path, c.path)); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	var kept int
+	for _, c := range u.files {
+		dst := filepath.Join(u.dest, c.path)
+		if !same(filepath.Join(u.path, c.path), dst) || os.Remove(dst) != nil {
+			kept++
+		}
+	}
+	// children before parents; dirs that still hold other files fail and stay
+	slices.SortFunc(u.made, func(a, b string) int { return len(b) - len(a) })
+	for _, d := range u.made {
+		os.Remove(d)
+	}
+	verb := "copy"
+	if u.move {
+		verb = "move"
+	}
+	s := fmt.Sprintf("undid %s to %s", verb, u.dest)
+	if kept > 0 {
+		s += fmt.Sprintf(", %d file(s) left there (differ from the worktree)", kept)
+	}
 	return s, nil
+}
+
+// same reports whether b still matches a, so undo never deletes a copy edited since.
+func same(a, b string) bool {
+	if ta, err := os.Readlink(a); err == nil {
+		tb, err := os.Readlink(b)
+		return err == nil && ta == tb
+	}
+	// ponytail: reads both files whole; fine for uncommitted files
+	ba, errA := os.ReadFile(a)
+	bb, errB := os.ReadFile(b)
+	return errA == nil && errB == nil && bytes.Equal(ba, bb)
 }
 
 func copyPath(src, dst string) error {
@@ -442,6 +563,7 @@ type mode int
 const (
 	modeList mode = iota
 	modeDiff
+	modePick
 	modeDest
 	modeConfirm
 )
@@ -453,6 +575,24 @@ type completion struct {
 	cycling bool
 }
 
+// picker keeps its own worktree and files so a reload or status refresh mid-pick can't retarget the transfer.
+type picker struct {
+	w     *wt
+	files []change
+	on    []bool
+	cur   int
+}
+
+func (p picker) picked() []change {
+	var cs []change
+	for i, c := range p.files {
+		if p.on[i] {
+			cs = append(cs, c)
+		}
+	}
+	return cs
+}
+
 type model struct {
 	dir, mainPath string
 	wts           []*wt
@@ -462,7 +602,9 @@ type model struct {
 	diffPath      string
 	in            textinput.Model
 	comp          completion
+	pick          picker
 	move          bool
+	undo          *undo
 	lastDest      string
 	msg           string
 }
@@ -561,6 +703,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case doneMsg:
 		m.msg = msg.text
+		if msg.undo != nil {
+			m.undo = msg.undo
+		}
 		return m, statusCmd(msg.path)
 	case removedMsg:
 		if msg.err != nil {
@@ -576,6 +721,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.key(msg)
 	}
 	return m, nil
+}
+
+func (m model) verb() string {
+	if m.move {
+		return "move"
+	}
+	return "copy"
 }
 
 func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -599,6 +751,34 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, removeCmd(m.mainPath, w.path, len(w.files) > 0)
 		}
 		return m, nil
+	case modePick:
+		p := &m.pick
+		switch s {
+		case "esc", "q":
+			m.mode = modeList
+		case "up", "k":
+			p.cur = max(0, p.cur-1)
+		case "down", "j":
+			p.cur = min(len(p.files)-1, p.cur+1)
+		case " ":
+			p.on[p.cur] = !p.on[p.cur]
+		case "a":
+			all := !slices.Contains(p.on, false)
+			for i := range p.on {
+				p.on[i] = !all
+			}
+		case "enter":
+			n := len(p.picked())
+			if n == 0 {
+				return m, nil
+			}
+			m.mode = modeDest
+			m.in.Prompt = fmt.Sprintf("%s %d file(s) to: ", m.verb(), n)
+			m.in.Width = max(10, m.w-len(m.in.Prompt)-2)
+			m.in.SetValue(m.lastDest)
+			m.in.CursorEnd()
+		}
+		return m, nil
 	case modeDest:
 		switch s {
 		case "esc":
@@ -612,12 +792,11 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			dest := strings.TrimSpace(m.in.Value())
-			w := m.sel()
-			if dest == "" || w == nil {
+			if dest == "" {
 				return m, nil
 			}
 			m.mode, m.comp, m.lastDest, m.msg = modeList, completion{}, dest, "working…"
-			return m, transferCmd(w.path, w.files, dest, m.move)
+			return m, transferCmd(m.pick.w.path, m.pick.picked(), dest, m.move)
 		}
 		m.comp = completion{}
 		var cmd tea.Cmd
@@ -635,6 +814,14 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.msg = "refreshing…"
 		return m, loadCmd(m.dir)
+	case "u":
+		if m.undo == nil {
+			m.msg = "nothing to undo"
+			return m, nil
+		}
+		u := m.undo
+		m.undo, m.msg = nil, "undoing…"
+		return m, undoCmd(u)
 	}
 	w := m.sel()
 	if w == nil {
@@ -651,15 +838,8 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.msg = "no uncommitted files"
 			return m, nil
 		}
-		m.mode, m.move = modeDest, s == "m"
-		verb := "copy"
-		if m.move {
-			verb = "move"
-		}
-		m.in.Prompt = fmt.Sprintf("%s %d file(s) to: ", verb, len(w.files))
-		m.in.Width = max(10, m.w-len(m.in.Prompt)-2)
-		m.in.SetValue(m.lastDest)
-		m.in.CursorEnd()
+		m.mode, m.move = modePick, s == "m"
+		m.pick = picker{w: w, files: w.files, on: slices.Repeat([]bool{true}, len(w.files))}
 	case "x":
 		if w.main {
 			m.msg = "the main worktree can't be removed"
@@ -935,6 +1115,38 @@ func (m model) candLines() []string {
 	return lines[start : start+maxLines]
 }
 
+func (m model) pickView() string {
+	p := m.pick
+	lines := []string{bold.Render(pad(fmt.Sprintf("%s from %s: %d/%d file(s) selected",
+		m.verb(), p.w.name(), len(p.picked()), len(p.files)), m.w))}
+	rows := m.h - 2
+	top := max(0, min(p.cur-rows/2, len(p.files)-rows))
+	for i := top; i < min(len(p.files), top+rows); i++ {
+		c := p.files[i]
+		box := "[ ] "
+		if p.on[i] {
+			box = "[x] "
+		}
+		s := box + c.xy + " " + c.path
+		if c.orig != "" {
+			s += " ← " + c.orig
+		}
+		switch {
+		case i == p.cur:
+			s = selRow.Render(pad("> "+s, m.w))
+		case p.on[i]:
+			s = pad("  "+s, m.w)
+		default:
+			s = dim.Render(pad("  "+s, m.w))
+		}
+		lines = append(lines, s)
+	}
+	for len(lines) < m.h-1 {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n") + "\n" + dim.Render(ansi.Truncate("↑↓/jk move · space toggle · a all/none · enter next · esc cancel", m.w, "…"))
+}
+
 func (m model) View() string {
 	if m.w == 0 {
 		return ""
@@ -942,6 +1154,9 @@ func (m model) View() string {
 	if m.mode == modeDiff {
 		return bold.Render(pad("diff "+m.diffPath, m.w)) + "\n" + m.vp.View() + "\n" +
 			dim.Render("↑↓/jk pgup/pgdn ←→ scroll · q/esc back")
+	}
+	if m.mode == modePick {
+		return m.pickView()
 	}
 
 	var foot []string
@@ -962,7 +1177,7 @@ func (m model) View() string {
 		}
 		foot = []string{red.Render(q + " [y/N]"), ""}
 	default:
-		foot = []string{m.msg, dim.Render("↑↓/jk move · enter diff · c copy · m move · x remove · o open PR · r refresh · q quit")}
+		foot = []string{m.msg, dim.Render("↑↓/jk move · enter diff · c copy · m move · u undo · x remove · o open PR · r refresh · q quit")}
 	}
 
 	header := bold.Render("  " + renderCells([]cell{

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func sh(t *testing.T, dir, script string) {
@@ -35,7 +37,8 @@ func TestTransferMove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transfer(repo, files, dest, true); err != nil {
+	u, _, err := transfer(repo, files, dest, true)
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -48,16 +51,48 @@ func TestTransferMove(t *testing.T) {
 		}
 	}
 	// keep.txt collided in dest and del.txt had nothing to copy, so both stay dirty
-	left, _ := status(repo)
-	var got []string
-	for _, c := range left {
-		got = append(got, c.xy+" "+c.path)
+	names := func(cs []change) []string {
+		var ns []string
+		for _, c := range cs {
+			ns = append(ns, c.xy+" "+c.path+" "+c.orig)
+		}
+		return ns
 	}
-	if want := []string{" D del.txt", " M keep.txt"}; !slices.Equal(got, want) {
+	left, _ := status(repo)
+	if got, want := names(left), []string{" D del.txt ", " M keep.txt "}; !slices.Equal(got, want) {
 		t.Errorf("worktree left with %q, want %q", got, want)
 	}
 	if _, err := os.Stat(filepath.Join(repo, "r.txt")); err != nil {
 		t.Errorf("rename source not restored: %v", err)
+	}
+
+	// an edited copy must survive the undo
+	if err := os.WriteFile(filepath.Join(dest, "new.txt"), []byte("edited"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// undo must not restore over worktree edits made after the move
+	sh(t, repo, `echo later >> a.txt`)
+	if _, err := revert(u); err == nil {
+		t.Fatal("revert ran over a worktree edit")
+	}
+	sh(t, repo, `git checkout -q a.txt`)
+	if _, err := revert(u); err != nil {
+		t.Fatal(err)
+	}
+	back, _ := status(repo)
+	if got, want := names(back), names(files); !slices.Equal(got, want) {
+		t.Errorf("after undo worktree has %q, want %q", got, want)
+	}
+	if got, _ := os.ReadFile(filepath.Join(repo, "a.txt")); string(got) != "a\nmod\n" {
+		t.Errorf("a.txt after undo = %q", got)
+	}
+	ents, _ := os.ReadDir(dest)
+	var left2 []string
+	for _, e := range ents {
+		left2 = append(left2, e.Name())
+	}
+	if want := []string{"keep.txt", "new.txt"}; !slices.Equal(left2, want) {
+		t.Errorf("dest after undo has %q, want %q", left2, want)
 	}
 }
 
@@ -96,5 +131,30 @@ func TestTabCompletion(t *testing.T) {
 		if got := m.in.Value(); got != s.want {
 			t.Fatalf("step %d: got %q, want %q", i, got, s.want)
 		}
+	}
+}
+
+func TestPick(t *testing.T) {
+	var m tea.Model = newModel(t.TempDir())
+	m, _ = m.Update(loadedMsg{mainPath: "/wt", wts: []*wt{{path: "/wt", branch: "b", statusDone: true,
+		files: []change{{"??", "a", ""}, {"??", "b", ""}, {"??", "c", ""}}}}})
+	for _, k := range []tea.KeyMsg{
+		{Type: tea.KeyRunes, Runes: []rune("m")},
+		{Type: tea.KeyRunes, Runes: []rune("a")},
+		{Type: tea.KeyEnter}, // nothing selected, stays in the picker
+		{Type: tea.KeyRunes, Runes: []rune("a")},
+		{Type: tea.KeyDown},
+		{Type: tea.KeySpace, Runes: []rune(" ")},
+		{Type: tea.KeyEnter},
+	} {
+		m, _ = m.Update(k)
+	}
+	got := m.(model)
+	var paths []string
+	for _, c := range got.pick.picked() {
+		paths = append(paths, c.path)
+	}
+	if got.mode != modeDest || !slices.Equal(paths, []string{"a", "c"}) || got.in.Prompt != "move 2 file(s) to: " {
+		t.Errorf("mode %d, picked %q, prompt %q", got.mode, paths, got.in.Prompt)
 	}
 }
