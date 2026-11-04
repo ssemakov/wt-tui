@@ -1,13 +1,17 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func sh(t *testing.T, dir, script string) {
@@ -156,5 +160,23 @@ func TestPick(t *testing.T) {
 	}
 	if got.mode != modeDest || !slices.Equal(paths, []string{"a", "c"}) || got.in.Prompt != "move 2 file(s) to: " {
 		t.Errorf("mode %d, picked %q, prompt %q", got.mode, paths, got.in.Prompt)
+	}
+}
+
+func TestRemovingSpinner(t *testing.T) {
+	var m tea.Model = newModel(t.TempDir())
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 20})
+	m, _ = m.Update(loadedMsg{mainPath: "/main", wts: []*wt{{path: "/wt", branch: "b", statusDone: true}}})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	if v := ansi.Strip(m.View()); !strings.Contains(v, "removing b") {
+		t.Fatalf("row has no busy indicator:\n%s", v)
+	}
+	if _, cmd := m.Update(spinner.TickMsg{}); cmd == nil {
+		t.Error("spinner stopped while removing")
+	}
+	m, _ = m.Update(removedMsg{path: "/wt", err: errors.New("locked")})
+	if _, cmd := m.Update(spinner.TickMsg{}); cmd != nil {
+		t.Error("spinner still ticking after the removal failed")
 	}
 }

@@ -25,7 +25,7 @@ Status, size and PR load in the background, so slow `du`/`gh` calls never block 
 | `c` | copy uncommitted files to a directory |
 | `m` | move uncommitted files to a directory (copy, then discard them from the worktree) |
 | `u` | undo the last copy/move |
-| `x` | remove the worktree (asks `y/N`; dirty trees use `--force`) |
+| `x` | remove the worktree (asks `y/N`; dirty trees use `--force`); the row shows a spinner until git finishes |
 | `o` | open the PR in the browser |
 | `r` | reload everything |
 | `q` | quit |

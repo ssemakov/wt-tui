@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -42,6 +43,7 @@ type wt struct {
 	pr                           *pr
 	statusErr, prErr             string
 	statusDone, sizeDone, prDone bool
+	removing                     bool
 }
 
 type (
@@ -599,6 +601,7 @@ type model struct {
 	cur, w, h     int
 	mode          mode
 	vp            viewport.Model
+	spin          spinner.Model
 	diffPath      string
 	in            textinput.Model
 	comp          completion
@@ -625,7 +628,7 @@ func newModel(dir string) model {
 	in := textinput.New()
 	in.Cursor.SetMode(cursor.CursorStatic)
 	in.Focus()
-	return model{dir: dir, in: in, vp: viewport.New(0, 0), msg: "loading…"}
+	return model{dir: dir, in: in, vp: viewport.New(0, 0), spin: spinner.New(spinner.WithSpinner(spinner.MiniDot)), msg: "loading…"}
 }
 
 func (m model) Init() tea.Cmd { return loadCmd(m.dir) }
@@ -660,11 +663,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if w := m.sel(); w != nil {
 			prev = w.path
 		}
+		old := m.wts
 		m.mainPath, m.wts, m.cur, m.msg = msg.mainPath, msg.wts, 0, ""
 		var cmds []tea.Cmd
 		for i, w := range m.wts {
 			if w.path == prev {
 				m.cur = i
+			}
+			// a reload mid-removal still lists the worktree
+			for _, o := range old {
+				if o.path == w.path {
+					w.removing = o.removing
+				}
 			}
 			if w.prunable {
 				w.statusDone, w.sizeDone, w.prDone = true, true, true
@@ -710,6 +720,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case removedMsg:
 		if msg.err != nil {
 			m.msg = "error: " + msg.err.Error()
+			if w := m.find(msg.path); w != nil {
+				w.removing = false
+			}
 			return m, nil
 		}
 		if w := m.find(msg.path); w != nil {
@@ -717,6 +730,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.wts = slices.DeleteFunc(m.wts, func(w *wt) bool { return w.path == msg.path })
 		m.cur = max(0, min(m.cur, len(m.wts)-1))
+	case spinner.TickMsg:
+		// dropping the tick ends the chain once nothing is being removed
+		if slices.ContainsFunc(m.wts, func(w *wt) bool { return w.removing }) {
+			var cmd tea.Cmd
+			m.spin, cmd = m.spin.Update(msg)
+			return m, cmd
+		}
 	case tea.KeyMsg:
 		return m.key(msg)
 	}
@@ -747,8 +767,9 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case modeConfirm:
 		m.mode, m.msg = modeList, "cancelled"
 		if w := m.sel(); w != nil && s == "y" {
-			m.msg = "removing " + w.name() + "…"
-			return m, removeCmd(m.mainPath, w.path, len(w.files) > 0)
+			w.removing, m.msg = true, "removing "+w.name()+"…"
+			// the spinner drops stale ticks, so a chain already running isn't doubled
+			return m, tea.Batch(removeCmd(m.mainPath, w.path, len(w.files) > 0), m.spin.Tick)
 		}
 		return m, nil
 	case modePick:
@@ -828,6 +849,10 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.msg = ""
+	if w.removing {
+		m.msg = w.name() + " is being removed"
+		return m, nil
+	}
 	switch s {
 	case "enter", "d":
 		m.mode, m.diffPath = modeDiff, w.path
@@ -1003,8 +1028,12 @@ func (m model) row(w *wt, sel bool) string {
 	if len(w.tmux) > 0 {
 		tmux = "●"
 	}
+	name, nameStyle := w.name(), plain
+	if w.removing {
+		name, nameStyle = m.spin.View()+" removing "+name, dim
+	}
 	line := renderCells([]cell{
-		{w.name(), m.nameW(), plain},
+		{name, m.nameW(), nameStyle},
 		{chg, 4, chgStyle},
 		{up, 9, upStyle},
 		{prt, 13, prStyle},
