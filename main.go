@@ -568,6 +568,7 @@ const (
 	modePick
 	modeDest
 	modeConfirm
+	modeSearch
 )
 
 type completion struct {
@@ -609,6 +610,8 @@ type model struct {
 	move          bool
 	undo          *undo
 	lastDest      string
+	query         string
+	from          int
 	msg           string
 }
 
@@ -743,6 +746,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// matches uses smartcase: an uppercase letter in q makes it case-sensitive.
+func (w *wt) matches(q string) bool {
+	hay := w.name() + "\n" + filepath.Base(w.path)
+	if strings.ToLower(q) == q {
+		hay = strings.ToLower(hay)
+	}
+	return strings.Contains(hay, q)
+}
+
+// next returns the first worktree after from in dir matching q, wrapping around like vim; -1 if none.
+func (m model) next(q string, from, dir int) int {
+	n := len(m.wts)
+	for i := 1; i <= n; i++ {
+		if j := ((from+dir*i)%n + n) % n; m.wts[j].matches(q) {
+			return j
+		}
+	}
+	return -1
+}
+
 func (m model) verb() string {
 	if m.move {
 		return "move"
@@ -800,6 +823,41 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.in.CursorEnd()
 		}
 		return m, nil
+	case modeSearch:
+		// a removal finishing mid-search can shrink the list under from
+		back := max(0, min(m.from, len(m.wts)-1))
+		switch s {
+		case "esc":
+			m.mode, m.cur, m.msg = modeList, back, ""
+			return m, nil
+		case "enter":
+			q := m.in.Value()
+			if q == "" {
+				q = m.query
+			}
+			m.mode = modeList
+			if q == "" {
+				return m, nil
+			}
+			m.query, m.msg = q, "/"+q
+			if i := m.next(q, m.from, 1); i >= 0 {
+				m.cur = i
+			} else {
+				m.cur, m.msg = back, "pattern not found: "+q
+			}
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.in, cmd = m.in.Update(k)
+		// incremental: each keystroke searches again from where / was pressed
+		q := m.in.Value()
+		m.cur, m.msg = back, ""
+		if i := m.next(q, m.from, 1); q != "" && i >= 0 {
+			m.cur = i
+		} else if q != "" {
+			m.msg = "pattern not found: " + q
+		}
+		return m, cmd
 	case modeDest:
 		switch s {
 		case "esc":
@@ -843,6 +901,28 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		u := m.undo
 		m.undo, m.msg = nil, "undoing…"
 		return m, undoCmd(u)
+	case "/":
+		m.mode, m.from, m.msg = modeSearch, m.cur, ""
+		m.in.Prompt = "/"
+		m.in.Width = max(10, m.w-len(m.in.Prompt)-2)
+		m.in.SetValue("")
+		return m, nil
+	case "n", "N":
+		if m.query == "" {
+			m.msg = "no previous search"
+			return m, nil
+		}
+		dir := 1
+		if s == "N" {
+			dir = -1
+		}
+		m.msg = "/" + m.query
+		if i := m.next(m.query, m.cur, dir); i >= 0 {
+			m.cur = i
+		} else {
+			m.msg = "pattern not found: " + m.query
+		}
+		return m, nil
 	}
 	w := m.sel()
 	if w == nil {
@@ -877,6 +957,17 @@ func (m model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if err := exec.Command("open", w.pr.URL).Start(); err != nil {
+			m.msg = "error: " + err.Error()
+		}
+	case "y":
+		name := w.branch
+		if name == "" {
+			name = filepath.Base(w.path)
+		}
+		c := exec.Command("pbcopy")
+		c.Stdin = strings.NewReader(name)
+		m.msg = "yanked " + name
+		if err := c.Run(); err != nil {
 			m.msg = "error: " + err.Error()
 		}
 	}
@@ -1205,8 +1296,14 @@ func (m model) View() string {
 			q += " open in tmux " + strings.Join(w.tmux, ", ") + "."
 		}
 		foot = []string{red.Render(q + " [y/N]"), ""}
+	case modeSearch:
+		hint := dim.Render("enter jump · esc cancel · then n/N next/prev")
+		if m.msg != "" {
+			hint = red.Render(m.msg)
+		}
+		foot = []string{m.in.View(), hint}
 	default:
-		foot = []string{m.msg, dim.Render("↑↓/jk move · enter diff · c copy · m move · u undo · x remove · o open PR · r refresh · q quit")}
+		foot = []string{m.msg, dim.Render("↑↓/jk move · / search · n/N next/prev · enter diff · c copy · m move · u undo · y yank · x remove · o open PR · r refresh · q quit")}
 	}
 
 	header := bold.Render("  " + renderCells([]cell{

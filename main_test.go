@@ -180,3 +180,44 @@ func TestRemovingSpinner(t *testing.T) {
 		t.Error("spinner still ticking after the removal failed")
 	}
 }
+
+func TestSearch(t *testing.T) {
+	var m tea.Model = newModel(t.TempDir())
+	m, _ = m.Update(loadedMsg{mainPath: "/repo/trunk", wts: []*wt{
+		{path: "/repo/trunk", branch: "main", main: true}, {path: "/w/a", branch: "feature-a"},
+		{path: "/w/b", branch: "bugfix-b"}, {path: "/w/c", branch: "feature-c"},
+	}})
+	press := func(keys ...string) int {
+		for _, k := range keys {
+			msg := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+			switch k {
+			case "enter":
+				msg = tea.KeyMsg{Type: tea.KeyEnter}
+			case "esc":
+				msg = tea.KeyMsg{Type: tea.KeyEsc}
+			}
+			m, _ = m.Update(msg)
+		}
+		return m.(model).cur
+	}
+	steps := []struct {
+		keys []string
+		want int
+	}{
+		{[]string{"/", "f", "e", "a"}, 1}, // jumps while typing
+		{[]string{"enter", "n"}, 3},
+		{[]string{"n"}, 1}, // wraps
+		{[]string{"N"}, 3}, // wraps back
+		{[]string{"/", "f"}, 1},
+		{[]string{"esc"}, 3},
+		{[]string{"/", "F", "e", "a", "t", "enter"}, 3},      // smartcase: uppercase misses
+		{[]string{"/", "t", "r", "u", "n", "k", "enter"}, 0}, // directory name matches
+		{[]string{"/", "f", "e", "a", "enter"}, 1},
+		{[]string{"/", "enter"}, 3}, // empty repeats the last search
+	}
+	for i, s := range steps {
+		if got := press(s.keys...); got != s.want {
+			t.Fatalf("step %d %q: cursor %d, want %d", i, s.keys, got, s.want)
+		}
+	}
+}

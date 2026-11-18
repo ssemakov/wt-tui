@@ -21,12 +21,15 @@ Status, size and PR load in the background, so slow `du`/`gh` calls never block 
 | key | action |
 |---|---|
 | `↑` `↓` / `k` `j` | move |
+| `/` | search worktrees by branch or directory name, jumping as you type (smartcase); `enter` keeps the match, `esc` returns |
+| `n` / `N` | next / previous match of the last search, wrapping around |
 | `enter` / `d` | diff of uncommitted changes (tracked vs `HEAD`, plus untracked files as new files); `q`/`esc` back |
 | `c` | copy uncommitted files to a directory |
 | `m` | move uncommitted files to a directory (copy, then discard them from the worktree) |
 | `u` | undo the last copy/move |
 | `x` | remove the worktree (asks `y/N`; dirty trees use `--force`); the row shows a spinner until git finishes |
 | `o` | open the PR in the browser |
+| `y` | copy the branch name (directory name when detached) to the clipboard |
 | `r` | reload everything |
 | `q` | quit |
 
@@ -54,5 +57,5 @@ created for them; copies edited since are left in place.
 
 Copy `wt-tui` somewhere on `$PATH` and run it inside any worktree or the main checkout.
 
-Requires Go 1.23+, `git`. Optional: `gh` (authenticated) for PRs, `tmux` for pane status. `o` uses macOS `open`.
+Requires Go 1.23+, `git`. Optional: `gh` (authenticated) for PRs, `tmux` for pane status. `o` and `y` use macOS `open` and `pbcopy`.
 # wt-tui
