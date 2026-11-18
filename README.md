@@ -2,6 +2,8 @@
 
 Terminal UI for the git worktrees of the repo you run it from.
 
+<img width="1409" height="753" alt="image" src="https://github.com/user-attachments/assets/938b4e6c-7060-43cb-8e7e-9f00f90c37df" />
+
 ## Shows
 
 For each worktree:
